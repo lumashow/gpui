@@ -908,6 +908,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn can_start_external_drag(&self) -> bool {
         false
     }
+    /// Lock the pointer where it is and hide it, or release it. While locked
+    /// the pointer sends no absolute motion; its relative motion accumulates
+    /// for [`PlatformWindow::take_pointer_delta`]. Whether the pointer is now
+    /// locked: `false` where the platform cannot lock one.
+    fn set_pointer_lock(&self, _locked: bool) -> bool {
+        false
+    }
+    /// Relative pointer motion since the previous call, while locked.
+    fn take_pointer_delta(&self) -> Point<Pixels> {
+        Point::default()
+    }
     fn start_external_drag(&self, _payload: &ExternalDragPayload) -> bool {
         false
     }
@@ -928,6 +939,24 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
+    /// See [`crate::Window::wgpu_device`].
+    // LUMA LOCAL EDIT: not upstream. The default is the answer for every
+    // compositor that is not `gpui_wgpu`.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn wgpu_device(&self) -> Option<crate::WgpuDevice> {
+        None
+    }
+    /// See [`crate::Window::hdr_output`].
+    // LUMA LOCAL EDIT: not upstream. `gpui_wgpu` implements HDR10 output;
+    // every other compositor presents SDR.
+    // TODO(macOS): EDR through `CAMetalLayer.wantsExtendedDynamicRangeContent`
+    // with the same contract (UI at SDR white, the viewport above it).
+    fn hdr_output(&self) -> Option<crate::HdrOutput> {
+        None
+    }
+    /// See [`crate::Window::set_hdr_output_allowed`].
+    // LUMA LOCAL EDIT: not upstream.
+    fn set_hdr_output_allowed(&self, _allowed: bool) {}
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
@@ -988,6 +1017,28 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
 }
 
+/// Current and high-water GPU scratch holdings exposed only to test hosts.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RendererScratchDiagnostics {
+    /// Current backdrop scratch pair dimensions in device pixels.
+    pub backdrop: Option<(u64, u64)>,
+    /// Current isolated-content scratch pair dimensions, one per layer slot.
+    pub content_filters: Vec<(u64, u64)>,
+    /// Largest bytes retained by each scratch family during this renderer's life.
+    pub backdrop_high_water_bytes: u64,
+    /// Largest aggregate isolated-content scratch holding, in bytes.
+    pub content_filter_high_water_bytes: u64,
+    /// Current consecutive unused-frame counts.
+    pub backdrop_idle_frames: u32,
+    /// Consecutive frames without isolated-content filtering.
+    pub content_filter_idle_frames: u32,
+    /// Whether each scratch family's Gaussian kernel remains cached.
+    pub backdrop_kernel_cached: bool,
+    /// Whether the isolated-content Gaussian kernel remains cached.
+    pub content_filter_kernel_cached: bool,
+}
+
 /// A renderer for headless windows that can produce real rendered output.
 #[cfg(any(test, feature = "test-support"))]
 pub trait PlatformHeadlessRenderer {
@@ -1007,6 +1058,18 @@ pub trait PlatformHeadlessRenderer {
 
     /// Returns the sprite atlas used by this renderer.
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+
+    /// Narrow GPU-scratch observability for renderer regression tests.
+    fn scratch_diagnostics(&self) -> Option<RendererScratchDiagnostics> {
+        None
+    }
+
+    /// See [`crate::Window::wgpu_device`].
+    // LUMA LOCAL EDIT: not upstream.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn wgpu_device(&self) -> Option<crate::WgpuDevice> {
+        None
+    }
 }
 
 /// Type alias for runnables with metadata.
@@ -1328,6 +1391,29 @@ pub trait PlatformAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
+
+    /// Replace the pixels of an already-resident tile, in place.
+    ///
+    /// Returns whether `key` was resident. Callers must treat `false` as "the
+    /// tile is gone, insert it again" — which is exactly what the next
+    /// [`Self::get_or_insert_with`] does, so the observable result is the same
+    /// either way and only the cost differs.
+    ///
+    /// The default drops the tile and rebuilds it, which is correct for every
+    /// backend. A backend that can overwrite an existing allocation should do
+    /// so instead: a live viewport hands the atlas a new frame of the same size
+    /// many times a second, and freeing and reallocating a full-screen texture
+    /// at that rate fragments the allocator and leaves the driver a destroy
+    /// backlog that grows for as long as the view is open.
+    ///
+    /// `bytes` must match the resident tile's size and format; a backend that
+    /// cannot verify this may assume it.
+    // LUMA LOCAL EDIT: this method is not upstream. The default drops the
+    // tile so unpatched backends stay correct.
+    fn update(&self, key: &AtlasKey, _bytes: &[u8]) -> bool {
+        self.remove(key);
+        false
+    }
 
     #[cfg(any(test, feature = "test-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {

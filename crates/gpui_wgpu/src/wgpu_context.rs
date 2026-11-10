@@ -141,6 +141,38 @@ impl WgpuContext {
         })
     }
 
+    /// LUMA LOCAL EDIT: a context with no surface and no display, for
+    /// `WgpuHeadlessRenderer`. It takes the adapter wgpu ranks first for
+    /// high performance; there is no surface to test it against.
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    pub fn new_headless() -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        let adapter = gpui::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        }))
+        .context("no GPU adapter for headless rendering")?;
+        let (device, queue, dual_source_blending, color_texture_format) =
+            gpui::block_on(Self::create_device(&adapter))?;
+        let backend = WgpuBackend::Native(adapter.get_info().backend);
+        Ok(Self {
+            instance,
+            adapter,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            backend,
+            dual_source_blending,
+            color_texture_format,
+            device_lost: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     #[cfg(target_family = "wasm")]
     pub async fn new_web(
         canvas: &web_sys::HtmlCanvasElement,
@@ -249,6 +281,18 @@ impl WgpuContext {
                 Subpixel text antialiasing will be disabled."
             );
         }
+        // LUMA LOCAL EDIT: a renderer drawing on this device (see
+        // `WgpuDevice`) profiles itself with timestamps. Declaring the feature
+        // costs nothing; writing timestamps is per-frame and opt-in.
+        if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+        // LUMA LOCAL EDIT: the renderer's haze kernels need subgroup
+        // operations. Without them the compositor still opens and the
+        // renderer reports the missing feature itself.
+        if adapter.features().contains(wgpu::Features::SUBGROUP) {
+            required_features |= wgpu::Features::SUBGROUP;
+        }
 
         let color_atlas_texture_format = Self::select_color_texture_format(adapter)?;
         #[cfg(target_family = "wasm")]
@@ -261,10 +305,38 @@ impl WgpuContext {
                 .using_resolution(adapter.limits())
                 .using_alignment(adapter.limits())
         };
+        // LUMA LOCAL EDIT: the compositor itself is happy with downlevel
+        // limits, but a renderer sharing this device (see `WgpuDevice`) is
+        // not — it wants the WebGPU defaults, which every desktop adapter
+        // meets. Ask for them when the adapter can give them, and fall back
+        // to what the compositor alone needs when it cannot.
+        //
+        // The renderer also needs the adapter's storage-buffer limits, as
+        // `luma_render::device` asks for its own device. The scene pass binds
+        // more than the default eight storage buffers and sixteen sampled
+        // textures per stage.
         #[cfg(not(target_family = "wasm"))]
-        let required_limits = wgpu::Limits::downlevel_defaults()
-            .using_resolution(adapter.limits())
-            .using_alignment(adapter.limits());
+        let required_limits = {
+            let wanted = wgpu::Limits::default()
+                .using_resolution(adapter.limits())
+                .using_alignment(adapter.limits());
+            if wanted.check_limits(&adapter.limits()) {
+                let limits = adapter.limits();
+                wgpu::Limits {
+                    max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
+                    max_buffer_size: limits.max_buffer_size,
+                    max_storage_buffers_per_shader_stage: limits
+                        .max_storage_buffers_per_shader_stage,
+                    max_sampled_textures_per_shader_stage: limits
+                        .max_sampled_textures_per_shader_stage,
+                    ..wanted
+                }
+            } else {
+                wgpu::Limits::downlevel_defaults()
+                    .using_resolution(adapter.limits())
+                    .using_alignment(adapter.limits())
+            }
+        };
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -482,6 +554,7 @@ impl WgpuContext {
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
+            color_space: wgpu::SurfaceColorSpace::Srgb,
         };
 
         surface.configure(&device, &test_config);
@@ -560,6 +633,17 @@ impl WgpuContext {
     }
 
     /// Returns a clone of the device_lost flag for sharing with renderers.
+    /// This device as a renderer would borrow it.
+    // LUMA LOCAL EDIT: not upstream.
+    pub fn shared_device(&self) -> gpui::WgpuDevice {
+        gpui::WgpuDevice {
+            device: Arc::clone(&self.device),
+            queue: Arc::clone(&self.queue),
+            adapter: self.adapter.clone(),
+            lost: Arc::clone(&self.device_lost),
+        }
+    }
+
     pub(crate) fn device_lost_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.device_lost)
     }

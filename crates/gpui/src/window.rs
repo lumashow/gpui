@@ -2,20 +2,19 @@
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
-#[cfg(feature = "profiler")]
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds,
+    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations,
+    DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
+    Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId,
+    GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -27,8 +26,6 @@ use crate::{
 
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
-#[cfg(target_os = "macos")]
-use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
 use futures::FutureExt;
 use futures::channel::oneshot;
@@ -1183,6 +1180,7 @@ pub struct Window {
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
+    input_load: InputLoad,
     #[cfg(feature = "profiler")]
     window_profiler: profiler::WindowProfiler,
     last_input_modality: InputModality,
@@ -1212,6 +1210,23 @@ pub struct Window {
 struct ModifierState {
     modifiers: Modifiers,
     saw_other_input: bool,
+}
+
+/// What input dispatch cost the thread since the last [`Window::take_input_load`].
+///
+/// Always on and cheap (two clock reads per event), so an app can put it in a
+/// frame trace: a pointer at 1000 Hz dispatches many events per frame, and
+/// their cost is otherwise invisible time between frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InputLoad {
+    /// Events dispatched.
+    pub events: u32,
+    /// Of those, mouse moves.
+    pub mouse_moves: u32,
+    /// Wall time spent dispatching them.
+    pub busy: Duration,
+    /// The longest single dispatch.
+    pub longest: Duration,
 }
 
 /// Tracks input event timestamps to determine if input is arriving at a high rate.
@@ -1869,6 +1884,7 @@ impl Window {
             hovered,
             needs_present,
             input_rate_tracker,
+            input_load: InputLoad::default(),
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             last_input_modality: InputModality::Mouse,
@@ -3969,6 +3985,75 @@ impl Window {
         result
     }
 
+    /// Scale painted content about its center without changing layout. This
+    /// paint-only transform is intended for transient surface animations.
+    pub fn paint_scaled_layer<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        scale: f32,
+        paint: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        if !scale.is_finite() || (scale - 1.0).abs() <= f32::EPSILON {
+            return paint(self);
+        }
+        let parent = mem::take(&mut self.next_frame.scene);
+        let result = paint(self);
+        let child = mem::replace(&mut self.next_frame.scene, parent);
+        self.next_frame.scene.append_scaled(
+            &child,
+            bounds.center().scale(self.scale_factor()),
+            scale.max(0.01),
+        );
+        result
+    }
+
+    /// Rasterize only the subtree painted by `f` into a transparent offscreen
+    /// layer, Gaussian-blur it, then composite it at `scale` about the center
+    /// of `bounds`. Content below the subtree is never sampled. This is the
+    /// filtered-content counterpart to [`Self::paint_backdrop_blur`].
+    ///
+    /// Filtered layers may not be nested. Platforms without a native filtered
+    /// layer renderer paint the subtree sharply at its normal size.
+    pub fn paint_filtered_layer<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        blur_radius: Pixels,
+        scale: f32,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (blur_radius, scale);
+            return self.paint_layer(bounds, f);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let parent = mem::take(&mut self.next_frame.scene);
+            let result = f(self);
+            let mut child = mem::replace(&mut self.next_frame.scene, parent);
+            assert!(
+                child.content_filters.is_empty() && child.backdrop_blurs.is_empty(),
+                "paint_filtered_layer subtrees cannot contain backdrop or nested content filters"
+            );
+            child.finish();
+
+            let scale_factor = self.scale_factor();
+            self.next_frame.scene.insert_content_filter(crate::ContentFilter {
+                order: 0,
+                blur_radius: blur_radius.scale(scale_factor),
+                bounds: bounds.scale(scale_factor),
+                content_mask: self.content_mask().scale(scale_factor),
+                scale: scale.max(0.01),
+                scene: Arc::new(child),
+            });
+            result
+        }
+    }
+
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
     /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
     /// after the element's background so they layer on top of the fill.
@@ -4050,6 +4135,44 @@ impl Window {
                 pad: 0,
             });
         }
+    }
+
+    /// Paint everything already below `bounds` back through a Gaussian blur.
+    /// Content painted after this call composites above the blur.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let scale_factor = self.scale_factor();
+        let scaled_bounds = bounds.scale(scale_factor);
+        let scaled_radii = corner_radii.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        // Force a primitive-batch boundary at this draw order. Backdrop blur
+        // itself lives outside PrimitiveBatch, so without the splitter a run
+        // of same-kind primitives could straddle the snapshot point.
+        self.next_frame.scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.0),
+            bounds: scaled_bounds,
+            corner_radii: scaled_radii,
+            content_mask,
+            color: transparent_black(),
+            element_bounds: scaled_bounds,
+            element_corner_radii: scaled_radii,
+            inset: 0,
+            pad: 0,
+        });
+        self.next_frame.scene.insert_backdrop_blur(BackdropBlur {
+            order: 0,
+            opacity: self.element_opacity(),
+            blur_radius: blur_radius.scale(scale_factor),
+            bounds: scaled_bounds,
+            content_mask,
+            corner_radii: scaled_radii,
+        });
     }
 
     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
@@ -4405,7 +4528,7 @@ impl Window {
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                pad: 0,
+                nearest: false.into(),
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
@@ -4577,7 +4700,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            nearest: data.nearest.into(),
             grayscale: grayscale.into(),
             bounds: visible_bounds_snapped,
             content_mask,
@@ -4591,8 +4714,27 @@ impl Window {
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    #[cfg(target_os = "macos")]
-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+    // LUMA LOCAL EDIT: on every platform; see `SurfaceHandle`.
+    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, source: crate::SurfaceHandle) {
+        self.insert_surface(bounds, source, false);
+    }
+
+    /// [`Self::paint_surface`] for a rendered frame its producer drew smaller
+    /// than `bounds` on purpose, to save GPU time. The compositor may upscale
+    /// it with a content-aware scaler (MetalFX Spatial on macOS) rather than
+    /// stretch it bilinearly. Where no such scaler exists, or the sizes
+    /// already agree, this is exactly `paint_surface`.
+    // LUMA LOCAL EDIT: not upstream.
+    pub fn paint_upscaled_surface(&mut self, bounds: Bounds<Pixels>, source: crate::SurfaceHandle) {
+        self.insert_surface(bounds, source, true);
+    }
+
+    fn insert_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        source: crate::SurfaceHandle,
+        upscale: bool,
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
@@ -4603,8 +4745,52 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            image_buffer,
+            source,
+            upscale,
         });
+    }
+
+    /// The device this window's compositor draws with, where that compositor
+    /// is `gpui_wgpu`.
+    ///
+    /// A renderer that builds its frames on this device can hand them to
+    /// [`Self::paint_surface`] as they are: same device, same queue, so the
+    /// compositor's draw is ordered after the renderer's submit by the queue
+    /// itself and nothing is copied or fenced. `None` where the compositor is
+    /// something else (Metal, DirectX) or has not been created yet.
+    // LUMA LOCAL EDIT: not upstream.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn wgpu_device(&self) -> Option<crate::WgpuDevice> {
+        self.platform_window.wgpu_device()
+    }
+
+    /// Replace the pixels of an image already in the sprite atlas, keeping its
+    /// identity and its allocation.
+    ///
+    /// This is the path for a surface whose *contents* change every frame while
+    /// its size does not — a live viewport, a video frame. Minting a fresh
+    /// [`RenderImage`] each time instead gives the atlas a new key each time,
+    /// and a key it has never seen means a new allocation and, once the old one
+    /// is dropped, a freed texture: at frame rate that is a full-screen texture
+    /// created and destroyed continuously.
+    ///
+    /// Reusing an image's id without calling this would paint the *old* pixels,
+    /// because the atlas answers from its cache. Call it before painting.
+    ///
+    /// A frame whose tile is absent or has changed size is left for
+    /// [`Self::paint_image`] to insert, so a resize needs no special case.
+    pub fn update_image(&mut self, data: &RenderImage) -> Result<()> {
+        for frame_index in 0..data.frame_count() {
+            let Some(bytes) = data.as_bytes(frame_index) else {
+                continue;
+            };
+            let params = RenderImageParams {
+                image_id: data.id,
+                frame_index,
+            };
+            self.sprite_atlas.update(&params.into(), bytes);
+        }
+        Ok(())
     }
 
     /// Removes an image from the sprite atlas.
@@ -5007,6 +5193,38 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        let started = Instant::now();
+        let mouse_move = matches!(event, PlatformInput::MouseMove(_));
+        let result = self.dispatch_event_inner(event, cx);
+        let spent = started.elapsed();
+        let load = &mut self.input_load;
+        load.events += 1;
+        load.mouse_moves += u32::from(mouse_move);
+        load.busy += spent;
+        load.longest = load.longest.max(spent);
+        result
+    }
+
+    /// Lock the pointer in place and hide it, as a game or an editor's fly
+    /// camera does, or release it where it was locked. Whether it is now
+    /// locked: `false` where the platform cannot lock one. Read the motion
+    /// with [`Window::take_pointer_delta`]; a locked pointer sends no moves.
+    pub fn set_pointer_lock(&self, locked: bool) -> bool {
+        self.platform_window.set_pointer_lock(locked)
+    }
+
+    /// Relative pointer motion since the previous call, while the pointer is
+    /// locked. Zero otherwise.
+    pub fn take_pointer_delta(&self) -> Point<Pixels> {
+        self.platform_window.take_pointer_delta()
+    }
+
+    /// The input dispatch cost since the previous call, and reset it.
+    pub fn take_input_load(&mut self) -> InputLoad {
+        std::mem::take(&mut self.input_load)
+    }
+
+    fn dispatch_event_inner(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
@@ -6009,6 +6227,25 @@ impl Window {
     /// Currently returns None on Mac and Windows.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.platform_window.gpu_specs()
+    }
+
+    /// The luminance range this window presents in, when it presents HDR.
+    ///
+    /// `None` means the window presents SDR: the platform, the display or the
+    /// preference (see [`Self::set_hdr_output_allowed`]) does not allow HDR.
+    /// Content drawn for an HDR window keeps colour value 1.0 at SDR white and
+    /// may go up to [`crate::HdrOutput::headroom`] times brighter.
+    // LUMA LOCAL EDIT: not upstream.
+    pub fn hdr_output(&self) -> Option<crate::HdrOutput> {
+        self.platform_window.hdr_output()
+    }
+
+    /// Allow or forbid HDR output for this window. Allowed is the default,
+    /// and it has an effect only where the display accepts HDR. The change
+    /// applies from the next frame; request one with [`Self::refresh`].
+    // LUMA LOCAL EDIT: not upstream.
+    pub fn set_hdr_output_allowed(&self, allowed: bool) {
+        self.platform_window.set_hdr_output_allowed(allowed);
     }
 
     /// Perform titlebar double-click action.

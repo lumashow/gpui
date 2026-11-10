@@ -312,6 +312,11 @@ fn oklab_to_linear_srgb(color: vec4<f32>) -> vec4<f32> {
 
 fn over(below: vec4<f32>, above: vec4<f32>) -> vec4<f32> {
     let alpha = above.a + below.a * (1.0 - above.a);
+    // Two fully transparent colors (an element faded to opacity 0) would
+    // divide 0 by 0 here, and the NaN paints as a black border.
+    if (alpha <= 0.0) {
+        return vec4<f32>(0.0);
+    }
     let color = (above.rgb * above.a + below.rgb * below.a * (1.0 - above.a)) / alpha;
     return vec4<f32>(color, alpha);
 }
@@ -1261,7 +1266,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 
 struct PolychromeSprite {
     order: u32,
-    pad: u32,
+    nearest: u32,
     grayscale: u32,
     opacity: f32,
     bounds: Bounds,
@@ -1293,13 +1298,20 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    let sprite = load_poly_sprite(input.sprite_id);
+    // Nearest: the centre of the texel under this pixel, kept inside the tile
+    // so a neighbour in the atlas never shows at the edge.
+    let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+    let first = vec2<f32>(sprite.tile.bounds.origin);
+    let last = first + vec2<f32>(sprite.tile.bounds.size) - 1.0;
+    let texel = clamp(floor(input.tile_position * atlas_size), first, last);
+    let uv = select(input.tile_position, (texel + 0.5) / atlas_size, sprite.nearest != 0u);
+    let sample = textureSample(t_sprite, s_sprite, uv);
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
-    let sprite = load_poly_sprite(input.sprite_id);
     let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     var color = sample;
@@ -1312,22 +1324,17 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 
 // --- surfaces --- //
 
-struct SurfaceParams {
+// A foreign renderer's frame, already in this target's own encoding: the
+// texture is sampled and written as is, exactly as a polychrome sprite is.
+// (Upstream's YCbCr video surface was never wired to this renderer and is
+// gone; a frame from `Window::paint_surface` is one BGRA plane.)
+struct Surface {
     bounds: Bounds,
     content_mask: Bounds,
 }
 
-@group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
-@group(1) @binding(1) var t_y: texture_2d<f32>;
-@group(1) @binding(2) var t_cb_cr: texture_2d<f32>;
-@group(1) @binding(3) var s_surface: sampler;
-
-const ycbcr_to_RGB = mat4x4<f32>(
-    vec4<f32>( 1.0000f,  1.0000f,  1.0000f, 0.0),
-    vec4<f32>( 0.0000f, -0.3441f,  1.7720f, 0.0),
-    vec4<f32>( 1.4020f, -0.7141f,  0.0000f, 0.0),
-    vec4<f32>(-0.7010f,  0.5291f, -0.8860f, 1.0),
-);
+@group(2) @binding(0) var t_surface: texture_2d<f32>;
+@group(2) @binding(1) var s_surface: sampler;
 
 struct SurfaceVarying {
     @builtin(position) position: vec4<f32>,
@@ -1336,27 +1343,36 @@ struct SurfaceVarying {
 }
 
 @vertex
-fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
+fn vs_surface(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> SurfaceVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let surface = load_surface(instance_id);
 
     var out = SurfaceVarying();
-    out.position = to_device_position(unit_vertex, surface_locals.bounds);
+    out.position = to_device_position(unit_vertex, surface.bounds);
     out.texture_position = unit_vertex;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, surface_locals.bounds, surface_locals.content_mask);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, surface.bounds, surface.content_mask);
     return out;
 }
 
 @fragment
 fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_surface, s_surface, input.texture_position);
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
+    return sample;
+}
 
-    let y_cb_cr = vec4<f32>(
-        textureSampleLevel(t_y, s_surface, input.texture_position, 0.0).r,
-        textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
-        1.0);
-
-    return ycbcr_to_RGB * y_cb_cr;
+// LUMA LOCAL EDIT: a frame in linear light — an `Rgba16Float` surface, which
+// only an HDR-aware renderer paints (see `hdr.rs`). Its values may exceed 1.0;
+// they are encoded to extended sRGB, unclamped, so they reach the target in
+// the encoding every other primitive is drawn in.
+@fragment
+fn fs_surface_linear(input: SurfaceVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_surface, s_surface, input.texture_position);
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(linear_to_srgb_extended(sample.rgb), sample.a);
 }

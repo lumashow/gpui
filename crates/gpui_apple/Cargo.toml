@@ -33,6 +33,16 @@ image.workspace = true
 log.workspace = true
 metal.workspace = true
 objc.workspace = true
+objc2.workspace = true
+objc2-metal = { version = "0.3", features = [
+    "MTLAllocation",
+    "MTLCommandBuffer",
+    "MTLDevice",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLTexture",
+] }
+objc2-metal-fx = { version = "0.3", features = ["MTLFXSpatialScaler"] }
 parking_lot.workspace = true
 
 [target.'cfg(target_os = "macos")'.build-dependencies]

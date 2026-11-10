@@ -13,6 +13,7 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -50,6 +51,14 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// Backdrop-blur regions — deliberately OUTSIDE the primitive batch
+    /// stream: the renderer breaks its render pass at each blur's order to
+    /// snapshot the framebuffer (macOS Metal; other renderers ignore them).
+    pub backdrop_blurs: Vec<BackdropBlur>,
+    /// Independently rasterized subtrees which are filtered before being
+    /// composited into this scene. Unlike backdrop blur, these never sample
+    /// content below the subtree.
+    pub content_filters: Vec<ContentFilter>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +75,8 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.backdrop_blurs.clear();
+        self.content_filters.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -82,6 +93,32 @@ impl Scene {
     pub fn pop_layer(&mut self) {
         self.layer_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
+    }
+
+    pub fn insert_backdrop_blur(&mut self, mut blur: BackdropBlur) {
+        let clipped_bounds = blur.bounds.intersect(&blur.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return;
+        }
+        blur.order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        self.backdrop_blurs.push(blur);
+        self.paint_operations
+            .push(PaintOperation::BackdropBlur(blur));
+    }
+
+    pub fn insert_content_filter(&mut self, mut filter: ContentFilter) {
+        let clipped_bounds = filter.bounds.intersect(&filter.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return;
+        }
+        filter.order = self.primitive_bounds.insert(clipped_bounds);
+        self.content_filters.push(filter.clone());
+        self.paint_operations
+            .push(PaintOperation::ContentFilter(filter));
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
@@ -142,7 +179,110 @@ impl Scene {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::BackdropBlur(blur) => self.insert_backdrop_blur(*blur),
+                PaintOperation::ContentFilter(filter) => self.insert_content_filter(filter.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                PaintOperation::EndLayer => self.pop_layer(),
+            }
+        }
+    }
+
+    /// Append a painted subtree scaled about `center`, preserving its layers
+    /// and blur radii. Layout and hit testing remain in the original space.
+    pub fn append_scaled(&mut self, child: &Scene, center: Point<ScaledPixels>, factor: f32) {
+        let point = |value: Point<ScaledPixels>| {
+            crate::point(
+                center.x + (value.x - center.x) * factor,
+                center.y + (value.y - center.y) * factor,
+            )
+        };
+        let bounds = |value: Bounds<ScaledPixels>| Bounds {
+            origin: point(value.origin),
+            size: crate::size(value.size.width * factor, value.size.height * factor),
+        };
+        let transform = TransformationMatrix::unit()
+            .translate(center)
+            .scale(crate::size(factor, factor))
+            .translate(crate::point(center.x * -1.0, center.y * -1.0));
+        let inverse = TransformationMatrix::unit()
+            .translate(center)
+            .scale(crate::size(1.0 / factor, 1.0 / factor))
+            .translate(crate::point(center.x * -1.0, center.y * -1.0));
+        // All primitives carry these two rectangles. Transform the stored
+        // bounds as well as sprite matrices so batching sees the painted area.
+        macro_rules! geometry {
+            ($value:expr) => {{
+                $value.bounds = bounds($value.bounds);
+                $value.content_mask.bounds = bounds($value.content_mask.bounds);
+            }};
+        }
+        for operation in &child.paint_operations {
+            match operation {
+                PaintOperation::Primitive(primitive) => {
+                    let mut primitive = primitive.clone();
+                    match &mut primitive {
+                        Primitive::Shadow(value) => {
+                            geometry!(value);
+                            value.element_bounds = bounds(value.element_bounds);
+                            value.corner_radii = value.corner_radii.map(|radius| *radius * factor);
+                            value.element_corner_radii =
+                                value.element_corner_radii.map(|radius| *radius * factor);
+                            value.blur_radius *= factor;
+                        }
+                        Primitive::Quad(value) => {
+                            geometry!(value);
+                            value.corner_radii = value.corner_radii.map(|radius| *radius * factor);
+                            value.border_widths = value.border_widths.map(|width| *width * factor);
+                        }
+                        Primitive::Underline(value) => {
+                            geometry!(value);
+                            value.thickness *= factor;
+                        }
+                        Primitive::Path(value) => {
+                            geometry!(value);
+                            value.start = point(value.start);
+                            value.current = point(value.current);
+                            for vertex in &mut value.vertices {
+                                vertex.xy_position = point(vertex.xy_position);
+                                vertex.content_mask.bounds = bounds(vertex.content_mask.bounds);
+                            }
+                        }
+                        Primitive::MonochromeSprite(value) => {
+                            geometry!(value);
+                            value.transformation =
+                                transform.compose(value.transformation).compose(inverse);
+                        }
+                        Primitive::SubpixelSprite(value) => {
+                            geometry!(value);
+                            value.transformation =
+                                transform.compose(value.transformation).compose(inverse);
+                        }
+                        Primitive::PolychromeSprite(value) => {
+                            geometry!(value);
+                            value.corner_radii = value.corner_radii.map(|radius| *radius * factor);
+                        }
+                        Primitive::Surface(value) => {
+                            geometry!(value);
+                        }
+                    }
+                    self.insert_primitive(primitive);
+                }
+                PaintOperation::BackdropBlur(blur) => {
+                    let mut blur = *blur;
+                    geometry!(blur);
+                    blur.corner_radii = blur.corner_radii.map(|radius| *radius * factor);
+                    self.insert_backdrop_blur(blur);
+                }
+                PaintOperation::ContentFilter(filter) => {
+                    let mut filter = filter.clone();
+                    geometry!(filter);
+                    let mut scene = Scene::default();
+                    scene.append_scaled(&filter.scene, center, factor);
+                    scene.finish();
+                    filter.scene = Arc::new(scene);
+                    self.insert_content_filter(filter);
+                }
+                PaintOperation::StartLayer(rect) => self.push_layer(bounds(*rect)),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
@@ -160,6 +300,8 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.backdrop_blurs.sort_by_key(|blur| blur.order);
+        self.content_filters.sort_by_key(|filter| filter.order);
     }
 
     #[cfg_attr(
@@ -213,8 +355,24 @@ pub(crate) enum PrimitiveKind {
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    BackdropBlur(BackdropBlur),
+    ContentFilter(ContentFilter),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+}
+
+/// A subtree rendered into a transparent offscreen target, Gaussian-filtered,
+/// then composited at `order`. `scale` transforms only the final texture about
+/// the center of `bounds`; it does not perturb layout or hit testing.
+#[derive(Clone)]
+#[expect(missing_docs)]
+pub struct ContentFilter {
+    pub order: DrawOrder,
+    pub blur_radius: ScaledPixels,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub scale: f32,
+    pub scene: Arc<Scene>,
 }
 
 #[derive(Clone)]
@@ -568,6 +726,22 @@ impl From<Underline> for Primitive {
     }
 }
 
+/// A within-window backdrop blur region: the renderer snapshots everything
+/// painted below this order and paints it back gaussian-blurred inside the
+/// rounded bounds (frosted-glass popovers). Supported by Metal and wgpu — see
+/// [`crate::Window::paint_backdrop_blur`].
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct BackdropBlur {
+    pub order: DrawOrder,
+    pub opacity: f32,
+    pub blur_radius: ScaledPixels,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+}
+
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -748,7 +922,8 @@ impl From<SubpixelSprite> for Primitive {
 #[expect(missing_docs)]
 pub struct PolychromeSprite {
     pub order: DrawOrder,
-    pub pad: u32,
+    /// Sample the nearest texel: each texel a hard-edged block at any scale.
+    pub nearest: PaddedBool32,
     pub grayscale: PaddedBool32,
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,
@@ -763,14 +938,36 @@ impl From<PolychromeSprite> for Primitive {
     }
 }
 
+/// Memory a foreign renderer drew into that this platform's compositor can
+/// sample without a copy.
+///
+/// One name on every platform, so a caller has a single `paint_surface` to
+/// call; what the name means is the compositor's business. Metal samples an
+/// `IOSurface` through a `CVPixelBuffer`; `gpui_wgpu` samples a texture that
+/// lives on its own device (see [`Window::wgpu_device`], which is how a
+/// renderer gets hold of that device). Where the compositor has no such
+/// memory the type is uninhabited: nothing can be painted, and code that
+/// matches on a surface still compiles.
+// LUMA LOCAL EDIT: upstream is macOS-only.
+#[cfg(target_os = "macos")]
+pub type SurfaceHandle = core_video::pixel_buffer::CVPixelBuffer;
+/// See the macOS definition.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub type SurfaceHandle = wgpu::Texture;
+/// See the macOS definition.
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+pub type SurfaceHandle = std::convert::Infallible;
+
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
 pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    pub source: SurfaceHandle,
+    /// LUMA LOCAL EDIT: painted with `Window::paint_upscaled_surface`; the
+    /// compositor may upscale it with something better than bilinear.
+    pub upscale: bool,
 }
 
 impl From<PaintSurface> for Primitive {

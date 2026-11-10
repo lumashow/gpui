@@ -97,6 +97,16 @@ pub(crate) use arena::*;
 pub use asset_cache::*;
 pub use assets::*;
 pub use color::*;
+/// The `CVPixelBuffer` vocabulary [`Window::paint_surface`] and [`PaintSurface`]
+/// speak.
+///
+/// Exported because those two already name the type in their public signatures.
+/// Without this a caller has to depend on `core-video` itself and match this
+/// crate's version exactly, or it hands over a structurally identical type the
+/// compiler rejects — the version being an implementation detail is precisely
+/// what makes it the wrong thing to make callers guess.
+#[cfg(target_os = "macos")]
+pub use core_video;
 pub use ctor::ctor;
 #[cfg(feature = "profiler")]
 pub use debug_overlay::*;
@@ -110,6 +120,11 @@ pub use gpui_macros::{
     AppContext, IntoElement, Render, VisualContext, bench, property_test, register_action, test,
 };
 pub use spring::*;
+/// The `wgpu` vocabulary [`Window::paint_surface`], [`PaintSurface`] and
+/// [`Window::wgpu_device`] speak, re-exported for the same reason as
+/// `core_video` above.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub use wgpu;
 
 /// Defines a Criterion benchmark group for benchmarks annotated with [`gpui::bench`].
 ///
@@ -335,6 +350,52 @@ where
     {
         self.borrow_mut().default_global::<G>();
         self.update_global(f)
+    }
+}
+
+/// A `gpui_wgpu` compositor's device, for a renderer that wants to draw on it.
+///
+/// Everything here is a shared handle: cloning it neither creates nor owns a
+/// device. `lost` is set by the driver's device-lost callback and stays set —
+/// a holder that sees it should ask its window for a fresh handle rather than
+/// keep submitting to a device that will never answer.
+// LUMA LOCAL EDIT: not upstream.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[derive(Clone, Debug)]
+pub struct WgpuDevice {
+    /// The compositor's device.
+    pub device: std::sync::Arc<wgpu::Device>,
+    /// Its one queue.
+    pub queue: std::sync::Arc<wgpu::Queue>,
+    /// The adapter the device was requested from.
+    pub adapter: wgpu::Adapter,
+    /// Whether the driver has reported the device lost.
+    pub lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The luminance range of a window that presents high-dynamic-range output.
+///
+/// A window in this mode shows a colour value of 1.0 at `sdr_white_nits`,
+/// which is where the display shows every SDR window, so user-interface
+/// colours look the same as they do in SDR. Values above 1.0 are brighter
+/// than SDR white, up to `peak_nits`.
+///
+/// See [`Window::hdr_output`].
+// LUMA LOCAL EDIT: not upstream.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HdrOutput {
+    /// Luminance of SDR white (colour value 1.0), in cd/m².
+    pub sdr_white_nits: f32,
+    /// Highest luminance the display shows, in cd/m².
+    pub peak_nits: f32,
+}
+
+impl HdrOutput {
+    /// How far above SDR white the display goes, as a multiple of SDR white.
+    /// Never less than 1.
+    #[must_use]
+    pub fn headroom(self) -> f32 {
+        (self.peak_nits / self.sdr_white_nits).max(1.0)
     }
 }
 

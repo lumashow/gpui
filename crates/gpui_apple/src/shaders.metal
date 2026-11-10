@@ -715,8 +715,18 @@ fragment float4 polychrome_sprite_fragment(
   PolychromeSprite sprite = sprites[input.sprite_id];
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
-  float4 sample =
-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  float2 uv = input.tile_position;
+  if (sprite.nearest) {
+    // The centre of the texel under this pixel, kept inside the tile so a
+    // neighbour in the atlas never shows at the edge.
+    float2 atlas_size =
+        float2(atlas_texture.get_width(), atlas_texture.get_height());
+    float2 first = float2(sprite.tile.bounds.origin.x, sprite.tile.bounds.origin.y);
+    float2 last = first +
+        float2(sprite.tile.bounds.size.width, sprite.tile.bounds.size.height) - 1.;
+    uv = (clamp(floor(uv * atlas_size), first, last) + 0.5) / atlas_size;
+  }
+  float4 sample = atlas_texture.sample(atlas_texture_sampler, uv);
   float distance =
       quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
@@ -897,6 +907,17 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
   return ycbcrToRGBTransform * ycbcr;
+}
+
+// A surface whose pixels are already in the target's own format and colour
+// space. Sampling and returning them unchanged is what makes such a surface
+// interchangeable with the same frame uploaded into the polychrome atlas, which
+// is also BGRA8 and is also sampled without conversion.
+fragment float4 bgra_surface_fragment(SurfaceFragmentInput input [[stage_in]],
+                                      texture2d<float> bgra_texture
+                                      [[texture(SurfaceInputIndex_BgraTexture)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  return bgra_texture.sample(texture_sampler, input.texture_position);
 }
 
 float4 hsla_to_rgba(Hsla hsla) {
@@ -1276,4 +1297,106 @@ float4 fill_color(Background background,
   }
 
   return color;
+}
+
+struct BackdropBlurVertexOutput {
+  float4 position [[position]];
+  uint blur_id [[flat]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropBlurFragmentInput {
+  float4 position [[position]];
+  uint blur_id [[flat]];
+};
+
+vertex BackdropBlurVertexOutput backdrop_blur_vertex(
+    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropBlurInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  BackdropBlur blur = blurs[blur_id];
+  float4 device_position =
+      to_device_position(unit_vertex, blur.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, blur.bounds,
+                                                 blur.content_mask.bounds);
+  return BackdropBlurVertexOutput{
+      device_position,
+      blur_id,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 backdrop_blur_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
+    constant float4 &source_rect
+    [[buffer(BackdropBlurInputIndex_SourceRect)]],
+    texture2d<float> source_texture
+    [[texture(BackdropBlurInputIndex_SourceTexture)]]) {
+  constexpr sampler source_sampler(coord::normalized, address::clamp_to_edge,
+                                   filter::linear);
+  BackdropBlur blur = blurs[input.blur_id];
+
+  // Constant-alpha blending fades the blurred backdrop without changing its
+  // radius. Outside the rounded region, preserve the original pixels.
+  float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
+  if (distance > 0.) {
+    discard_fragment();
+  }
+
+  // The snapshot was gaussian-blurred on the GPU (MPSImageGaussianBlur)
+  // before this pass — one clean sample. The scratch texture covers only
+  // source_rect (x, y, width, height) of the drawable.
+  float2 uv = (input.position.xy - source_rect.xy) / source_rect.zw;
+  return source_texture.sample(source_sampler, uv);
+}
+
+struct ContentFilterVertexOutput {
+  float4 position [[position]];
+  float2 unit_position;
+  float clip_distance [[clip_distance]][4];
+};
+
+struct ContentFilterFragmentInput {
+  float4 position [[position]];
+  float2 unit_position;
+};
+
+vertex ContentFilterVertexOutput content_filter_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(ContentFilterInputIndex_Vertices)]],
+    constant ContentFilterComposite *composite
+    [[buffer(ContentFilterInputIndex_Composite)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(ContentFilterInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float4 clip_distance = distance_from_clip_rect(
+      unit_vertex, composite->destination_bounds, composite->content_mask.bounds);
+  return ContentFilterVertexOutput{
+      to_device_position(unit_vertex, composite->destination_bounds, viewport_size),
+      unit_vertex,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 content_filter_fragment(
+    ContentFilterFragmentInput input [[stage_in]],
+    constant ContentFilterComposite *composite
+    [[buffer(ContentFilterInputIndex_Composite)]],
+    texture2d<float> source_texture
+    [[texture(ContentFilterInputIndex_SourceTexture)]]) {
+  constexpr sampler source_sampler(coord::normalized, address::clamp_to_zero,
+                                   filter::linear);
+  float2 source_origin = float2(composite->source_bounds.origin.x,
+                                composite->source_bounds.origin.y);
+  float2 source_size = float2(composite->source_bounds.size.width,
+                              composite->source_bounds.size.height);
+  float2 source_position = source_origin + input.unit_position * source_size;
+  float2 texture_origin = float2(composite->source_texture_bounds.origin.x,
+                                 composite->source_texture_bounds.origin.y);
+  float2 texture_size = float2(composite->source_texture_bounds.size.width,
+                               composite->source_texture_bounds.size.height);
+  return source_texture.sample(source_sampler,
+                               (source_position - texture_origin) / texture_size);
 }

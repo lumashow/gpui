@@ -9,7 +9,7 @@ use gpui::{
     Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowDecorations, WindowKind, WindowParams, popup::PopupNotSupportedError, px,
 };
-use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
 use collections::FxHashSet;
 use gpui_util::{ResultExt, maybe};
@@ -728,7 +728,11 @@ impl X11WindowState {
                     // If the window appearance changes, then the renderer will get updated
                     // too
                     transparent: false,
-                    preferred_present_mode: None,
+                    // LUMA LOCAL EDIT: the X11 refresh timer already paces frames.
+                    // Prefer Mailbox, as on Wayland, so FIFO backpressure does not
+                    // block that timer and make it skip refreshes. The renderer
+                    // falls back to FIFO when Mailbox is unsupported.
+                    preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
                 };
                 WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
             };
@@ -1922,6 +1926,21 @@ impl PlatformWindow for X11Window {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.0.state.borrow().renderer.gpu_specs().into()
+    }
+
+    // LUMA LOCAL EDIT: see `gpui::Window::wgpu_device`.
+    fn wgpu_device(&self) -> Option<gpui::WgpuDevice> {
+        self.0.state.borrow().renderer.wgpu_device()
+    }
+
+    // LUMA LOCAL EDIT: see `gpui::Window::hdr_output`.
+    fn hdr_output(&self) -> Option<gpui::HdrOutput> {
+        self.0.state.borrow().renderer.hdr_output()
+    }
+
+    // LUMA LOCAL EDIT: see `gpui::Window::set_hdr_output_allowed`.
+    fn set_hdr_output_allowed(&self, allowed: bool) {
+        self.0.state.borrow_mut().renderer.set_hdr_output_allowed(allowed);
     }
 
     fn play_system_bell(&self) {
